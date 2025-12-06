@@ -1,28 +1,42 @@
-name: Daily Gold Push
+name: Daily PushPlus Notification
 
 on:
   schedule:
+    # GitHub Actions 使用 UTC 时间
+    # 北京/台北时间 09:30 = UTC 时间 01:30
+    # 格式: 分 时 日 月 周
     - cron: '30 1 * * *'
-  workflow_dispatch: # 手动触发开关
+  
+  # 允许手动点击按钮触发（方便你现在测试）
+  workflow_dispatch:
 
 jobs:
-  run-gold-script:
+  run-pushplus:
     runs-on: ubuntu-latest
-    
+
     steps:
+      # 1. 检出代码
       - name: Checkout code
-        uses: actions/checkout@v3
-        
+        uses: actions/checkout@v4
+
+      # 2. 设置 Python 环境
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.9'
-          
+
+      # 3. 安装依赖 (如果你的项目有 requirements.txt)
       - name: Install dependencies
         run: |
-          pip install requests
-          
-      - name: Run script
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          # 如果没有 requirements.txt，但需要 requests 库，可以取消下面这行的注释
+          # pip install requests
+
+      # 4. 运行脚本 (关键修改在这里！)
+      - name: Run python main.py
         env:
+          # 左边是 Python 代码里读取的变量名 (os.environ.get('PUSHPLUS_TOKEN'))
+          # 右边是 GitHub Secrets 的引用
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: python main.py
