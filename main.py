@@ -6,7 +6,7 @@ import sys
 import random
 import time
 import json
-import statistics  # 用于计算平均值
+import statistics
 
 try:
     from dotenv import load_dotenv
@@ -30,27 +30,24 @@ def get_headers():
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "*/*",
         "Connection": "keep-alive",
+        "Referer": "https://quote.eastmoney.com/",
     }
 
 
 def calculate_technical_advice(price, history_prices):
     """
     根据历史数据生成决策建议
-    history_prices: 最近5天的价格列表 (不含今日，或者含今日)
+    history_prices: 最近几天的收盘价列表
     """
-    advice = "按需购买"
-    advice_icon = "☕"
-    signal_score = 50  # 0-100, 越高越不建议买，越低越建议买
-
     if not history_prices:
-        return advice, advice_icon, 50, None, None
+        return "数据不足，按需购买", "☕", 50, price, price
 
     # 计算 5日均线 (MA5)
-    # 如果历史数据不足5天，就用现有的
     all_prices = history_prices + [price]
+    # 取最后5个点计算均线
     ma5 = statistics.mean(all_prices[-5:])
 
-    # 计算本周高低点
+    # 计算本周(或近5日)高低点
     week_low = min(all_prices)
     week_high = max(all_prices)
 
@@ -64,144 +61,146 @@ def calculate_technical_advice(price, history_prices):
     if price < ma5:
         # 现价低于5日均线 -> 便宜
         if position_pct < 20:
-            advice = "本周极低位，强烈建议买入"
-            advice_icon = "🔥🔥"
-            signal_score = 10
+            advice = "近5日极低位，建议入手"
+            advice_icon = "🔥🔥"  # 火热推荐
         elif position_pct < 50:
-            advice = "低于周均价，适合入手"
-            advice_icon = "🛒"
-            signal_score = 30
+            advice = "低于周均价，适合买入"
+            advice_icon = "🛒"  # 购物车
         else:
-            advice = "趋势回调中，可以分批入"
+            advice = "趋势回调中，可分批入"
             advice_icon = "📉"
-            signal_score = 45
     else:
         # 现价高于5日均线 -> 贵
         if position_pct > 80:
-            advice = "本周极高位，千万别追高"
-            advice_icon = "🛑"
-            signal_score = 90
+            advice = "近5日高位，切勿追高"
+            advice_icon = "🛑"  # 停止
         else:
-            advice = "高于周均价，建议等待回调"
-            advice_icon = "✋"
-            signal_score = 70
+            advice = "高于周均价，建议观望"
+            advice_icon = "✋"  # 等待
 
     return advice, advice_icon, position_pct, week_low, week_high
 
 
-def get_price_yahoo_rich():
+def get_price_eastmoney_history():
     """
-    增强版雅虎接口：获取最近 5 天的数据进行趋势分析
+    主力接口：东方财富 K线历史接口 (替代雅虎)
+    获取最近 5 天的数据进行趋势分析
     """
-    print("--- [尝试] 雅虎财经 (获取5日趋势) ---")
+    print("--- [尝试] 东方财富 (K线趋势) ---")
     try:
-        # 获取 黄金期货 (GC=F) - 请求过去 5 天 (range=5d)
-        url_gold = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=5d"
-        resp_gold = requests.get(url_gold, headers=get_headers(), timeout=15)
-        data_gold = resp_gold.json()
+        # lmt=5: 获取最近5天
+        # klt=101: 日K
+        # secid=119.Au9999: 上海黄金交易所代码
+        url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=119.Au9999&fields1=f1&fields2=f51,f52,f53,f54,f55&klt=101&fqt=1&lmt=6"
 
-        # 获取 汇率 (CNY=X)
-        url_cny = "https://query1.finance.yahoo.com/v8/finance/chart/CNY=X?interval=1d&range=1d"
-        resp_cny = requests.get(url_cny, headers=get_headers(), timeout=10)
-        cny_rate = resp_cny.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        resp = requests.get(url, headers=get_headers(), timeout=10)
+        data = resp.json()
 
-        # 解析黄金历史数据
-        chart_result = data_gold["chart"]["result"][0]
-        timestamps = chart_result["timestamp"]
-        closes = chart_result["indicators"]["quote"][0]["close"]
+        if data and data.get("data") and data["data"].get("klines"):
+            klines = data["data"]["klines"]
+            # klines 格式: ["2023-10-20,460.5,462.1,459.8,461.0,...", ...]
+            # 解析收盘价 (index 2 是收盘价)
+            parsed_history = []
+            for k in klines:
+                # 东方财富K线数据是以逗号分隔的字符串
+                # 日期,开盘,收盘,最高,最低...
+                parts = k.split(",")
+                close_price = float(parts[2])
+                parsed_history.append(close_price)
 
-        # 过滤掉空值 (有时候休市会有 None)
-        valid_history = []
-        for ts, close in zip(timestamps, closes):
-            if close:
-                price_cny = (close * cny_rate) / 31.1035
-                valid_history.append(price_cny)
+            # 东方财富的历史数据包含今天(如果是交易时间)
+            # 我们取最后一个作为当前价
+            current_price = parsed_history[-1]
+            # 昨天的价格
+            prev_price = (
+                parsed_history[-2] if len(parsed_history) >= 2 else current_price
+            )
 
-        if not valid_history:
-            return None
+            # 历史列表 (不含今天，用于计算)
+            history_for_calc = parsed_history[:-1]
 
-        current_price = valid_history[-1]  # 最新的
-        prev_price = valid_history[-2] if len(valid_history) >= 2 else current_price
+            change = current_price - prev_price
+            pct = (change / prev_price) * 100
 
-        change = current_price - prev_price
-        pct = (change / prev_price) * 100
+            # 生成决策
+            advice, icon, pos_pct, w_low, w_high = calculate_technical_advice(
+                current_price, history_for_calc
+            )
 
-        # 生成决策数据
-        advice, icon, pos_pct, w_low, w_high = calculate_technical_advice(
-            current_price, valid_history[:-1]
-        )
+            # 格式化近3日走势 (取倒数第4到倒数第2个)
+            history_str_list = []
+            if len(parsed_history) >= 4:
+                recent = parsed_history[-4:-1]
+                history_str_list = [str(p) for p in recent]
 
-        # 格式化历史趋势字符串 (用于展示)
-        history_str_list = []
-        # 取最近3天 (不含今天)
-        recent_days = valid_history[-4:-1]
-        for p in recent_days:
-            history_str_list.append(str(round(p, 1)))
+            labor_fee = 25
+            est_price = current_price + labor_fee
+            bg_color = "#5cb85c" if change < 0 else "#d9534f"
 
-        labor_fee = 25
-        est_price = current_price + labor_fee
-
-        # 决定大背景颜色
-        bg_color = "#5cb85c" if change < 0 else "#d9534f"
-        if -0.5 < change < 0.5:
-            bg_color = "#6c757d"  # 震荡用灰色
-
-        return {
-            "source": "雅虎财经(5日趋势)",
-            "price": round(current_price, 2),
-            "change": round(change, 2),
-            "change_pct": round(pct, 2),
-            "advice": advice,
-            "advice_icon": icon,
-            "pos_pct": pos_pct,  # 价格在区间的位置 0-100
-            "week_low": round(w_low, 1),
-            "week_high": round(w_high, 1),
-            "history_trend": history_str_list,  # 历史价格列表
-            "bg_color": bg_color,
-            "est_price": round(est_price, 1),
-            "labor_fee": labor_fee,
-        }
-
+            return {
+                "source": "东方财富(趋势)",
+                "price": round(current_price, 2),
+                "change": round(change, 2),
+                "change_pct": round(pct, 2),
+                "advice": advice,
+                "advice_icon": icon,
+                "pos_pct": pos_pct,
+                "week_low": round(w_low, 1),
+                "week_high": round(w_high, 1),
+                "history_trend": history_str_list,
+                "bg_color": bg_color,
+                "est_price": round(est_price, 1),
+                "labor_fee": labor_fee,
+            }
     except Exception as e:
-        print(f"❌ 雅虎高级接口异常: {e}")
+        print(f"❌ 东方财富K线异常: {e}")
     return None
 
 
-def get_price_eastmoney_fallback():
+def get_price_sina_fallback():
     """
-    备用接口：东方财富 (仅当前快照，无历史分析)
+    备用接口：新浪财经 (老牌接口，最稳)
     """
-    print("--- [备用] 东方财富接口 ---")
-    url = "https://push2.eastmoney.com/api/qt/stock/get?secid=119.Au9999&fields=f43,f169,f170"
+    print("--- [备用] 新浪财经接口 ---")
+    url = "http://hq.sinajs.cn/list=gds_Au99_99"
     try:
-        resp = requests.get(url, headers=get_headers(), timeout=10)
-        d = resp.json().get("data")
-        if d and d["f43"] != "-":
-            price = float(d["f43"])
-            change = float(d["f169"])
-            pct = float(d["f170"])
+        resp = requests.get(url, headers=get_headers(), timeout=5)
+        if resp.status_code == 200:
+            # var hq_str_gds_Au99_99="黄金9999,476.50,475.10,478.00,474.00,...";
+            match = re.search(r'"([^"]+)"', resp.text)
+            if match:
+                d = match.group(1).split(",")
+                if len(d) > 8:
+                    current = float(d[3])
+                    prev = float(d[4])
+                    low = float(d[5])
+                    high = float(d[6])
 
-            # 备用模式下的简单建议
-            advice = "数据源仅含现价，建议观望"
-            bg_color = "#d9534f" if change > 0 else "#5cb85c"
+                    if current == 0:
+                        current = prev  # 休市处理
 
-            return {
-                "source": "东方财富(快照)",
-                "price": price,
-                "change": change,
-                "change_pct": pct,
-                "advice": "价格回调中" if change < 0 else "价格上涨中",
-                "advice_icon": "ℹ️",
-                "pos_pct": 50,  # 没数据，放中间
-                "week_low": price,  # 没数据，暂为现价
-                "week_high": price,
-                "history_trend": [],
-                "bg_color": bg_color,
-                "est_price": price + 25,
-                "labor_fee": 25,
-            }
+                    change = current - prev
+                    pct = (change / prev) * 100
+
+                    bg_color = "#5cb85c" if change < 0 else "#d9534f"
+
+                    return {
+                        "source": "新浪财经(快照)",
+                        "price": current,
+                        "change": round(change, 2),
+                        "change_pct": round(pct, 2),
+                        "advice": "价格回调中" if change < 0 else "价格上涨中",
+                        "advice_icon": "ℹ️",
+                        "pos_pct": 50,
+                        "week_low": low if low > 0 else current,
+                        "week_high": high if high > 0 else current,
+                        "history_trend": [],
+                        "bg_color": bg_color,
+                        "est_price": current + 25,
+                        "labor_fee": 25,
+                    }
     except Exception as e:
-        print(f"❌ 东方财富异常: {e}")
+        print(f"❌ 新浪财经异常: {e}")
     return None
 
 
@@ -210,67 +209,65 @@ def send_pushplus(data):
     date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
 
     change_sign = "+" if data["change"] > 0 else ""
-    change_str = f"{change_sign}{data['change']}"
-
-    # --- 构建可视化进度条 ---
-    # 根据 pos_pct (0-100) 计算小球的位置
-    # 左边是低(绿)，右边是高(红)
-    # 我们用一个 CSS 渐变条
 
     # 历史走势 HTML
     trend_html = ""
     if data["history_trend"]:
         trend_items = "".join(
             [
-                f"<span style='background:#f1f3f5; padding:2px 6px; border-radius:4px; font-size:12px; margin-right:4px; color:#666;'>{p}</span>"
+                f"<span style='background:#f3f3f3; padding:2px 5px; border-radius:4px; font-size:12px; margin-right:4px; color:#555; border:1px solid #eee;'>{p}</span>"
                 for p in data["history_trend"]
             ]
         )
-        trend_html = f"<div style='margin-top:8px; font-size:12px; color:#888;'>近3日走势: {trend_items} <span style='color:#333; font-weight:bold;'>→ {data['price']}</span></div>"
+        trend_html = f"<div style='margin-top:10px; font-size:12px; color:#666;'>近3日走势: {trend_items} <span style='color:#333; font-weight:bold;'>→ {data['price']}</span></div>"
 
+    # --- HTML 模板优化 (深色模式适配) ---
+    # 1. 最外层 section 强制白色背景，确保在深色模式下变成“卡片”而不是反色成黑色
+    # 2. 所有的文字颜色强制指定，防止反色后看不清
     content = f"""
-    <div style="font-family: sans-serif; max-width: 100%; background-color: #f8f9fa; padding: 12px; border-radius: 8px;">
+    <div style="font-family: -apple-system, sans-serif; max-width: 100%; background-color: #ffffff; padding: 15px; border-radius: 10px; border: 1px solid #eee; color: #333333;">
 
         <!-- 1. 核心价格卡片 -->
-        <div style="background: {data["bg_color"]}; border-radius: 12px; padding: 20px 15px; color: white; text-align: center; box-shadow: 0 4px 12px rgba(0,0,0,0.15);">
-            <div style="font-size: 13px; opacity: 0.9; margin-bottom: 4px;">水贝模式参考价 (Au99.99)</div>
-            <div style="font-size: 46px; font-weight: 800; line-height: 1;">{int(data["price"])}<span style="font-size: 18px;">.{str(data["price"]).split(".")[1]}</span></div>
-            <div style="margin-top: 10px; font-size: 15px; background: rgba(0,0,0,0.15); display: inline-block; padding: 4px 12px; border-radius: 20px;">
-                {change_str}元 ({change_sign}{data["change_pct"]}%)
+        <div style="background-color: {data["bg_color"]}; border-radius: 8px; padding: 20px 15px; color: #ffffff; text-align: center; box-shadow: 0 2px 8px rgba(0,0,0,0.1);">
+            <div style="font-size: 13px; opacity: 0.95; margin-bottom: 5px; color: #ffffff;">水贝模式参考价 (Au99.99)</div>
+            <div style="font-size: 42px; font-weight: 800; line-height: 1; color: #ffffff;">{data["price"]}</div>
+            <div style="margin-top: 10px;">
+                <span style="font-size: 14px; background-color: rgba(255,255,255,0.2); padding: 4px 12px; border-radius: 20px; color: #ffffff;">
+                    {change_sign}{data["change"]}元 ({change_sign}{data["change_pct"]}%)
+                </span>
             </div>
         </div>
 
-        <!-- 2. 决策辅助仪表盘 (核心功能) -->
-        <div style="background: white; margin-top: 15px; border-radius: 12px; padding: 15px; border: 1px solid #e9ecef;">
+        <!-- 2. 决策辅助仪表盘 -->
+        <div style="background-color: #fcfcfc; margin-top: 15px; border-radius: 8px; padding: 15px; border: 1px solid #f0f0f0;">
             <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
-                <span style="font-weight: bold; color: #333; font-size: 16px;">决策分析</span>
+                <span style="font-weight: bold; color: #333333; font-size: 16px;">决策分析</span>
                 <span style="font-size: 14px; font-weight: bold; color: {data["bg_color"]}">{data["advice_icon"]} {data["advice"]}</span>
             </div>
 
             <!-- 价格区间条 -->
-            <div style="margin-bottom: 5px; font-size: 12px; color: #666; display: flex; justify-content: space-between;">
+            <div style="margin-bottom: 5px; font-size: 12px; color: #666666; display: flex; justify-content: space-between;">
                 <span>周低 {data["week_low"]}</span>
                 <span>周高 {data["week_high"]}</span>
             </div>
-            <div style="position: relative; height: 12px; background: linear-gradient(90deg, #5cb85c 0%, #ffc107 50%, #d9534f 100%); border-radius: 6px; margin-bottom: 20px;">
-                <!-- 定位小球 -->
-                <div style="position: absolute; left: {data["pos_pct"]}%; top: -4px; width: 4px; height: 20px; background: #333; border: 2px solid white; border-radius: 2px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transform: translateX(-50%);"></div>
-                <div style="position: absolute; left: {data["pos_pct"]}%; top: -22px; transform: translateX(-50%); font-size: 12px; font-weight: bold; color: #333;">Current</div>
+            <!-- 进度条背景强制灰色，防止深色模式下消失 -->
+            <div style="position: relative; height: 10px; background: linear-gradient(90deg, #5cb85c 0%, #ffc107 50%, #d9534f 100%); border-radius: 5px; margin-bottom: 15px;">
+                <div style="position: absolute; left: {data["pos_pct"]}%; top: -3px; width: 6px; height: 16px; background-color: #333333; border: 2px solid #ffffff; border-radius: 4px; box-shadow: 0 2px 4px rgba(0,0,0,0.2); transform: translateX(-50%);"></div>
             </div>
 
             {trend_html}
         </div>
 
-        <!-- 3. 落地成本计算 -->
-        <div style="background: white; margin-top: 15px; border-radius: 12px; padding: 15px; border: 1px solid #e9ecef;">
-            <div style="font-size: 14px; color: #555; margin-bottom: 8px;">预估到手成本 (含{data["labor_fee"]}元工费)</div>
-            <div style="font-size: 24px; font-weight: bold; color: #f0ad4e;">
-                ¥ {data["est_price"]} <span style="font-size:14px; color:#999; font-weight:normal;">/克</span>
+        <!-- 3. 落地成本 -->
+        <div style="background-color: #f9f9f9; margin-top: 15px; border-radius: 8px; padding: 12px; border: 1px solid #eeeeee; display: flex; align-items: center; justify-content: space-between;">
+            <div style="font-size: 14px; color: #555555;">预估到手 (含工费)</div>
+            <div style="font-size: 20px; font-weight: bold; color: #f0ad4e;">
+                ¥ {data["est_price"]}
             </div>
         </div>
 
-        <div style="margin-top: 20px; text-align: center; color: #adb5bd; font-size: 12px;">
-            更新于: {date_str} | 源: {data["source"]}
+        <div style="margin-top: 15px; text-align: center; color: #cccccc; font-size: 12px;">
+            更新: {date_str} | 源: {data["source"]}
         </div>
     </div>
     """
@@ -278,7 +275,7 @@ def send_pushplus(data):
     url = "http://www.pushplus.plus/send"
     payload = {
         "token": TOKEN,
-        "title": f"{data['advice_icon']} 金价决策: {data['price']} ({change_sign}{data['change_pct']}%)",
+        "title": f"{data['advice_icon']} {data['price']} ({change_sign}{data['change']})",
         "content": content,
         "template": "html",
         "topic": TOPIC,
@@ -292,23 +289,20 @@ def send_pushplus(data):
 
 
 if __name__ == "__main__":
-    print("=== 决策辅助版启动 ===")
+    print("=== 决策辅助版 (V3) 启动 ===")
 
-    if not TOKEN:
-        print("🔍 提示: 本地无Token模式")
+    # 1. 尝试 东方财富 K线 (历史趋势)
+    data = get_price_eastmoney_history()
 
-    # 1. 优先尝试雅虎 (Rich Data)
-    data = get_price_yahoo_rich()
-
-    # 2. 失败则降级到东方财富 (Snapshot Data)
+    # 2. 失败则尝试 新浪财经 (快照)
     if not data:
-        data = get_price_eastmoney_fallback()
+        data = get_price_sina_fallback()
 
     if data:
         print(f"✅ 获取成功: {data['source']} | 现价: {data['price']} | 建议: {data['advice']}")
         if TOKEN:
             send_pushplus(data)
         else:
-            print("📢 [模拟推送] 内容已生成，请配置Token后查看效果")
+            print("📢 [模拟推送] Token未配置，跳过发送")
     else:
-        print("❌ 所有接口失败")
+        print("❌ 所有接口均失败，请检查网络或IP限制")
