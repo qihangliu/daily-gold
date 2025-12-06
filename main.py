@@ -5,6 +5,7 @@ import datetime
 import sys
 import random
 import time
+import json
 
 # 强制刷新输出缓存
 sys.stdout.reconfigure(encoding="utf-8")
@@ -16,56 +17,45 @@ TOPIC = "20251206"
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36 Edg/120.0.0.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/121.0",
 ]
 
 
-def get_random_headers(referer=""):
-    """生成随机的浏览器请求头"""
-    headers = {
+def get_headers():
+    return {
         "User-Agent": random.choice(USER_AGENTS),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
-        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
     }
-    if referer:
-        headers["Referer"] = referer
-    return headers
 
 
-def parse_gold_data(source_name, price, change, change_pct):
-    """
-    统一处理金价数据，生成文案和颜色
-    """
+def format_output(source_name, price, change, change_pct):
+    """统一格式化输出"""
     try:
         price = float(price)
         change = float(change)
         change_pct = float(change_pct)
-    except (ValueError, TypeError):
-        print(f"❌ 数据转换失败: {price}, {change}")
+    except:
         return None
 
     if change > 0:
         trend = "🔴 涨"
         advice = "今日在大盘高位，除非急需，建议暂缓。"
-        color = "#d9534f"  # 红
+        color = "#d9534f"
     elif change < 0:
         trend = "🟢 跌"
         advice = "机会来了！大盘回调，适合去展厅看款！"
-        color = "#5cb85c"  # 绿
+        color = "#5cb85c"
     else:
         trend = "⚪ 平"
         advice = "价格平稳，按需购买。"
-        color = "#333333"  # 黑
+        color = "#333333"
 
-    # 估算到手价 (大盘 + 25元工费)
-    est_price = price + 25
+    est_price = price + 25  # 估算工费
 
     return {
         "source": source_name,
-        "price": price,
+        "price": round(price, 2),
         "change": round(change, 2),
         "change_pct": round(change_pct, 2),
         "trend": trend,
@@ -75,107 +65,96 @@ def parse_gold_data(source_name, price, change, change_pct):
     }
 
 
-def get_price_from_sina():
-    """来源1：新浪财经"""
-    print("--- [尝试 1] 连接新浪财经接口 ---")
+# --- 接口 1: 东方财富 (国内权威，通常比新浪稳) ---
+def get_price_eastmoney():
+    print("--- [尝试] 东方财富接口 ---")
+    # secid=119.Au99.99 是上海黄金交易所的 Au99.99 代码
+    # f43: 最新价, f44: 最高, f45: 最低, f46: 今开, f60: 昨收, f169: 涨跌, f170: 涨跌幅
+    url = "https://push2.eastmoney.com/api/qt/stock/get?secid=119.Au9999&fields=f43,f60,f169,f170"
+
+    try:
+        resp = requests.get(url, headers=get_headers(), timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            if data and data.get("data"):
+                d = data["data"]
+                current = d["f43"]
+                change = d["f169"]
+                pct = d["f170"]
+
+                # 东方财富有时候休市返回 -
+                if current == "-":
+                    return None
+
+                # 东方财富的数据已经是数字了，直接用
+                return format_output("东方财富", current, change, pct)
+    except Exception as e:
+        print(f"❌ 东方财富异常: {e}")
+    return None
+
+
+# --- 接口 2: 雅虎财经 (美国本土，GitHub Actions 绝对不封) ---
+def get_price_yahoo_calc():
+    print("--- [尝试] 雅虎财经 (国际换算) ---")
+    # 逻辑：获取国际金价(美元/盎司) * 汇率 / 31.1035 = 人民币/克
+    try:
+        # 1. 获取 黄金期货 (GC=F)
+        url_gold = "https://query1.finance.yahoo.com/v8/finance/chart/GC=F?interval=1d&range=1d"
+        resp_gold = requests.get(url_gold, headers=get_headers(), timeout=10)
+        data_gold = resp_gold.json()
+        gold_usd_oz = data_gold["chart"]["result"][0]["meta"]["regularMarketPrice"]
+        prev_close_gold = data_gold["chart"]["result"][0]["meta"]["chartPreviousClose"]
+
+        # 2. 获取 美元兑人民币汇率 (CNY=X)
+        url_cny = "https://query1.finance.yahoo.com/v8/finance/chart/CNY=X?interval=1d&range=1d"
+        resp_cny = requests.get(url_cny, headers=get_headers(), timeout=10)
+        cny_rate = resp_cny.json()["chart"]["result"][0]["meta"]["regularMarketPrice"]
+
+        print(f"国际金价: ${gold_usd_oz}/oz, 汇率: {cny_rate}")
+
+        # 3. 换算
+        # 1 金衡盎司 = 31.1034768 克
+        price_cny_g = (gold_usd_oz * cny_rate) / 31.1035
+        prev_price_cny_g = (prev_close_gold * cny_rate) / 31.1035
+
+        change = price_cny_g - prev_price_cny_g
+        pct = (change / prev_price_cny_g) * 100
+
+        return format_output("雅虎财经(换算)", price_cny_g, change, pct)
+
+    except Exception as e:
+        print(f"❌ 雅虎财经异常: {e}")
+    return None
+
+
+# --- 原有接口 (新浪/腾讯) 也可以保留作为备选 ---
+def get_price_sina():
+    print("--- [尝试] 新浪财经 ---")
     url = "http://hq.sinajs.cn/list=gds_Au99_99"
-    # 新浪有时候校验 Referer
-    headers = get_random_headers("http://finance.sina.com.cn/")
-
     try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            text = response.text
-            # 检查空响应
-            if '=""' in text or '=","' in text:
-                print("❌ 新浪接口返回空数据")
-                return None
-
-            match = re.search(r'"([^"]+)"', text)
+        resp = requests.get(url, headers=get_headers(), timeout=5)
+        if resp.status_code == 200 and '=""' not in resp.text:
+            match = re.search(r'"([^"]+)"', resp.text)
             if match:
-                data = match.group(1).split(",")
-                if len(data) >= 5:
-                    current = float(data[3])
-                    yesterday = float(data[4])
-                    # 避免除以0错误
-                    if yesterday == 0:
-                        return None
-
-                    return parse_gold_data(
+                d = match.group(1).split(",")
+                if len(d) > 4:
+                    return format_output(
                         "新浪财经",
-                        current,
-                        current - yesterday,
-                        (current - yesterday) / yesterday * 100,
+                        d[3],
+                        float(d[3]) - float(d[4]),
+                        (float(d[3]) - float(d[4])) / float(d[4]) * 100,
                     )
-    except Exception as e:
-        print(f"❌ 新浪接口异常: {e}")
-    return None
-
-
-def get_price_from_tencent():
-    """来源2：腾讯财经 (IP限制较少)"""
-    print("--- [尝试 2] 连接腾讯财经接口 ---")
-    url = "http://qt.gtimg.cn/q=s_shau9999"
-    headers = get_random_headers("https://finance.qq.com/")
-
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code == 200:
-            text = response.text
-            match = re.search(r'"([^"]+)"', text)
-            if match:
-                data = match.group(1).split("~")
-                if len(data) >= 6:
-                    return parse_gold_data("腾讯财经", data[3], data[4], data[5])
-    except Exception as e:
-        print(f"❌ 腾讯接口异常: {e}")
-    return None
-
-
-def get_price_from_jijinhao():
-    """来源3：第一黄金网/集金号 (专业接口)"""
-    print("--- [尝试 3] 连接第一黄金网接口 ---")
-    # JO_92233 是 Au99.99 的代码
-    url = "https://api.jijinhao.com/sQuoteCenter/realTime.jsp?sCodes=JO_92233"
-    headers = get_random_headers("https://www.dyhjw.com/")
-
-    try:
-        response = requests.get(url, headers=headers, timeout=8)
-        if response.status_code == 200:
-            text = response.text
-            # 返回的是 JS 对象: var hq_json_JO_92233={"time"..., "last": "476.50", "pre_close": "475.00", ...}
-            # 我们用正则提取 json 部分
-            match = re.search(r"=\s*({.*?})", text)
-            if match:
-                import json
-
-                # 处理一下非标准的 JSON key (有时候 key 没有引号)
-                json_str = match.group(1)
-
-                # 简单正则提取数值，不依赖复杂的 JSON 解析库以防格式错误
-                last_match = re.search(r'"last":"([\d\.]+)"', json_str)
-                prev_match = re.search(r'"pre_close":"([\d\.]+)"', json_str)
-
-                if last_match and prev_match:
-                    current = float(last_match.group(1))
-                    yesterday = float(prev_match.group(1))
-
-                    if yesterday > 0:
-                        change = current - yesterday
-                        pct = (change / yesterday) * 100
-                        return parse_gold_data("第一黄金网", current, change, pct)
-    except Exception as e:
-        print(f"❌ 第一黄金网接口异常: {e}")
+    except:
+        pass
     return None
 
 
 def send_pushplus(data):
     if not data:
         return
+    print(f"--- 发送推送 ({data['source']}) ---")
 
-    print(f"--- 正在通过 PushPlus 推送 ({data['source']}) ---")
     date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-
     content = (
         f"<h3>💍 2025 夺金计划日报 ({date_str})</h3>"
         f"<div style='font-size:16px; margin-bottom:10px;'>"
@@ -185,7 +164,7 @@ def send_pushplus(data):
         f"<hr style='border:1px dashed #ccc;'>"
         f"<h4>🛒 预估落地价 (含工费)：</h4>"
         f"<p style='font-size:18px; font-weight:bold; color:#f0ad4e;'>¥ {data['est_price']} /克</p>"
-        f"<p style='font-size:12px; color:gray;'>*数据来源: {data['source']} / 水贝模式</p>"
+        f"<p style='font-size:12px; color:gray;'>*数据来源: {data['source']}</p>"
         f"<br>"
         f"<div style='background:#f9f9f9; padding:15px; border-left:5px solid {data['color']}; border-radius:5px;'>"
         f"<b>🤖 机器人建议：</b><br>{data['advice']}"
@@ -195,44 +174,37 @@ def send_pushplus(data):
     url = "http://www.pushplus.plus/send"
     payload = {
         "token": TOKEN,
-        "title": f"{data['trend']} 金价提醒：{data['price']}元",
+        "title": f"{data['trend']} 金价: {data['price']}",
         "content": content,
         "template": "html",
         "topic": TOPIC,
     }
-
     try:
-        # 推送也加上伪装头
-        headers = get_random_headers()
-        resp = requests.post(url, json=payload, headers=headers, timeout=10)
-        print(f"推送结果: {resp.text}")
+        requests.post(url, json=payload, timeout=10)
+        print("✅ 推送请求已发送")
     except Exception as e:
         print(f"❌ 推送失败: {e}")
 
 
 if __name__ == "__main__":
-    print("=== 脚本启动 ===")
     if not TOKEN:
         print("❌ 错误: PUSHPLUS_TOKEN 未设置")
-    else:
-        gold_data = None
+        sys.exit(1)
 
-        # 按顺序尝试 3 个接口
-        sources = [get_price_from_sina, get_price_from_tencent, get_price_from_jijinhao]
+    # 策略：优先用东方财富（国内准），不行用新浪，再不行用雅虎（国外稳）
+    # 雅虎是最后一道防线，因为它在美国绝对不会被封
+    strategies = [get_price_eastmoney, get_price_sina, get_price_yahoo_calc]
 
-        for get_price_func in sources:
-            gold_data = get_price_func()
-            if gold_data:
-                print("✅ 获取数据成功！")
-                break
-            else:
-                print("⚠️ 当前接口获取失败，1秒后尝试下一个...")
-                time.sleep(1) # 休息一下，模拟人类操作间隔
-
-        # 结果处理
+    gold_data = None
+    for strategy in strategies:
+        gold_data = strategy()
         if gold_data:
+            print(f"✅ 成功从 [{gold_data['source']}] 获取数据")
             send_pushplus(gold_data)
+            break
         else:
-            print("❌ 所有 3 个接口均获取失败，今日无法推送")
+            print("⚠️ 获取失败，切换下一个源...")
+            time.sleep(1)
 
-    print("=== 脚本结束 ===")
+    if not gold_data:
+        print("❌ 所有接口全军覆没，请检查网络或Token")
