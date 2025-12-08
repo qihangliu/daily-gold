@@ -1,11 +1,11 @@
-name: Daily PushPlus Notification
+name: Daily PushPlus
 
 on:
   schedule:
     # GitHub Actions 使用 UTC 时间
     # 北京/台北时间 09:30 = UTC 时间 01:30
     # 格式: 分 时 日 月 周
-    - cron: '30 1 * * *'
+    - cron: '30 9 * * *'
   
   # 允许手动点击按钮触发（方便测试）
   workflow_dispatch:
