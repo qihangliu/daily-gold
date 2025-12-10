@@ -1,44 +1,64 @@
-import requests
-import re
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+优化后的金价抓取并通过 PushPlus 推送
+特点：
+- 并行请求多个数据源，遇到第一个可用源即返回
+- 每个请求均指定 connect/read timeout，避免长时间挂起
+- 使用 requests.Session 复用连接
+- 可在 GitHub Actions 上稳定执行
+"""
+
 import os
-import datetime
+import re
 import sys
-import random
 import time
 import json
+import random
+import datetime
 import statistics
+from pathlib import Path
+from typing import Any, Dict, List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     from dotenv import load_dotenv
     load_dotenv()
-except ImportError:
+except Exception:
     pass
 
-sys.stdout.reconfigure(encoding='utf-8')
-TOKEN = os.environ.get("PUSHPLUS_TOKEN")
-TOPIC = "20251206"
+import requests
 
-# 扩充 User-Agent 池
+# ---------- 配置 ----------
+TOPIC = os.environ.get("PUSHPLUS_TOPIC", "20251206")
+TOKEN = os.environ.get("PUSHPLUS_TOKEN")
+# 每个requests的 (connect_timeout, read_timeout)
+PER_REQUEST_TIMEOUT = (3, 6)  # 3s 建连，6s 读取
+# 尝试所有数据源的整体超时（秒）
+OVERALL_TIMEOUT = 18
+# 并发线程数（数据源个数）
+MAX_WORKERS = 4
+
+# ---------- User-Agent 池 ----------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 16_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
 ]
 
-def get_headers(referer=None):
-    headers = {
+def get_headers(referer: Optional[str] = None) -> Dict[str, str]:
+    h = {
         "User-Agent": random.choice(USER_AGENTS),
         "Accept": "*/*",
-        "Connection": "keep-alive"
+        "Connection": "keep-alive",
     }
     if referer:
-        headers["Referer"] = referer
-    return headers
+        h["Referer"] = referer
+    return h
 
-def generate_basic_advice(price, change_pct):
-    """
-    当没有历史数据时，根据当日涨跌幅生成基础建议
-    """
+# ---------- 建议计算函数（保留你的逻辑） ----------
+def generate_basic_advice(price: float, change_pct: float):
     if change_pct < -1.2:
         return "今日大跌，黄金坑！", "🔥🔥", 10
     elif change_pct < -0.3:
@@ -50,10 +70,7 @@ def generate_basic_advice(price, change_pct):
     else:
         return "价格横盘，按需购买", "☕", 50
 
-def calculate_technical_advice(price, history_prices):
-    """
-    根据历史数据生成高级决策建议
-    """
+def calculate_technical_advice(price: float, history_prices: List[float]):
     if not history_prices or len(history_prices) < 3:
         return "数据源波动，建议分批", "⚖️", 50, price, price
 
@@ -88,80 +105,66 @@ def calculate_technical_advice(price, history_prices):
 
     return advice, advice_icon, position_pct, week_low, week_high
 
-# --- 接口1 (新): GoldPrice.org (全球数据源，通常不封) ---
-def get_price_goldpriceorg():
-    print("--- [尝试 1] GoldPrice.org (全球源) ---")
+# ---------- 数据源实现（都使用 session） ----------
+def get_price_goldpriceorg(session: requests.Session) -> Optional[Dict[str, Any]]:
+    """
+    GoldPrice.org 返回 CNY 的盎司价格 -> 换算为 元/克
+    该源通常稳定，不易被墙
+    """
     try:
-        # 这个接口直接返回人民币计价的黄金价格，非常方便
-        # 很多黄金插件都用这个
         url = "https://data-asg.goldprice.org/dbXRates/CNY"
-        resp = requests.get(url, headers=get_headers(), timeout=10)
-
-        if resp.status_code == 200:
-            data = resp.json()
-            # 格式: {"items":[{"curr":"CNY","xauPrice":17158.45,"xagPrice":...}]}
-            # xauPrice 是 1盎司黄金的人民币价格
-            if data and "items" in data and len(data["items"]) > 0:
-                price_oz_cny = data["items"][0]["xauPrice"]
-
-                # 换算: 1金衡盎司 = 31.1034768 克
-                price_g_cny = price_oz_cny / 31.1035
-
-                # GoldPrice.org 很难获取昨日收盘，我们用一个模拟的涨跌幅逻辑
-                # 或者如果有 history 接口更好，这里为了稳定性，我们假设它只提供现价
-                # 为了不报错，我们假设昨日价格是 (现价 / 1.001) 模拟 0.1% 波动，或者不显示涨跌
-
-                # 尝试获取涨跌幅 (GoldPrice首页一般有)
-                # 这里为了稳健，我们暂时给一个 mock 的涨跌，重点是拿到现价
-                change = 0
-                change_pct = 0
-
-                return {
-                    "source": "GoldPrice.org",
-                    "price": round(price_g_cny, 2),
-                    "change": 0, # 数据源限制，暂无涨跌额
-                    "change_pct": 0,
-                    "advice": "国际源数据，参考现价",
-                    "advice_icon": "🌐",
-                    "pos_pct": 50,
-                    "week_low": round(price_g_cny, 2),
-                    "week_high": round(price_g_cny, 2),
-                    "history_trend": [],
-                    "bg_color": "#333333", # 中性色
-                    "est_price": round(price_g_cny + 25, 1)
-                }
+        resp = session.get(url, headers=get_headers(), timeout=PER_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and "items" in data and len(data["items"]) > 0:
+            price_oz_cny = float(data["items"][0].get("xauPrice", 0))
+            if price_oz_cny <= 0:
+                return None
+            price_g_cny = price_oz_cny / 31.1035
+            return {
+                "source": "GoldPrice.org",
+                "price": round(price_g_cny, 2),
+                "change": 0,
+                "change_pct": 0,
+                "advice": "国际源数据，参考现价",
+                "advice_icon": "🌐",
+                "pos_pct": 50,
+                "week_low": round(price_g_cny, 2),
+                "week_high": round(price_g_cny, 2),
+                "history_trend": [],
+                "bg_color": "#333333",
+                "est_price": round(price_g_cny + 25, 1)
+            }
     except Exception as e:
-        print(f"❌ GoldPrice.org异常: {e}")
+        print(f"❌ GoldPrice.org 异常: {e}")
     return None
 
-# --- 接口2 (新): Binance (币安 API - 极稳) ---
-def get_price_binance():
-    print("--- [尝试 2] Binance (PAXG实物金代币) ---")
+def get_price_binance(session: requests.Session) -> Optional[Dict[str, Any]]:
+    """
+    通过 Binance PAXGUSDT 以及外汇换算到 CNY，并转为 元/克
+    """
     try:
-        # 1. 获取 PAXG/USDT (锚定1盎司黄金)
         url_gold = "https://api.binance.com/api/v3/ticker/price?symbol=PAXGUSDT"
-        resp_gold = requests.get(url_gold, headers=get_headers(), timeout=10)
+        url_rate = "https://api.exchangerate-api.com/v4/latest/USD"
+        resp_gold = session.get(url_gold, headers=get_headers(), timeout=PER_REQUEST_TIMEOUT)
+        resp_gold.raise_for_status()
         gold_price_usd = float(resp_gold.json()["price"])
 
-        # 2. 获取 汇率 (这里用一个免费的汇率API，或者直接给个固定值做保底)
-        # 免费汇率API: https://api.exchangerate-api.com/v4/latest/USD
-        url_rate = "https://api.exchangerate-api.com/v4/latest/USD"
-        resp_rate = requests.get(url_rate, headers=get_headers(), timeout=10)
-        cny_rate = resp_rate.json()["rates"]["CNY"]
+        resp_rate = session.get(url_rate, headers=get_headers(), timeout=PER_REQUEST_TIMEOUT)
+        resp_rate.raise_for_status()
+        cny_rate = float(resp_rate.json()["rates"].get("CNY", 0))
+        if cny_rate <= 0:
+            return None
 
-        print(f"PAXG(USD): {gold_price_usd}, 汇率: {cny_rate}")
-
-        # 计算
         price_cny = (gold_price_usd * cny_rate) / 31.1035
 
-        # 币安有24小时涨跌幅接口
         url_24h = "https://api.binance.com/api/v3/ticker/24hr?symbol=PAXGUSDT"
-        resp_24h = requests.get(url_24h, headers=get_headers(), timeout=10)
+        resp_24h = session.get(url_24h, headers=get_headers(), timeout=PER_REQUEST_TIMEOUT)
+        resp_24h.raise_for_status()
         data_24h = resp_24h.json()
-        price_change_percent = float(data_24h["priceChangePercent"])
-        price_change_amount = float(data_24h["priceChange"])
+        price_change_percent = float(data_24h.get("priceChangePercent", 0.0))
+        price_change_amount = float(data_24h.get("priceChange", 0.0))
 
-        # 换算涨跌额 (大概)
         change_cny = (price_change_amount * cny_rate) / 31.1035
 
         advice, icon, score = generate_basic_advice(price_cny, price_change_percent)
@@ -181,89 +184,104 @@ def get_price_binance():
             "est_price": round(price_cny + 25, 1)
         }
     except Exception as e:
-        print(f"❌ Binance异常: {e}")
+        print(f"❌ Binance 异常: {e}")
     return None
 
-# --- 接口3: 东方财富 K线 (历史最佳) ---
-def get_price_eastmoney_history():
-    print("--- [尝试 3] 东方财富 (K线趋势) ---")
+def get_price_eastmoney_history(session: requests.Session) -> Optional[Dict[str, Any]]:
+    """
+    东方财富历史 K 线（secid=119.Au9999）
+    """
     try:
         url = "https://push2his.eastmoney.com/api/qt/stock/kline/get?secid=119.Au9999&fields1=f1&fields2=f51,f52,f53,f54,f55&klt=101&fqt=1&lmt=6"
-        resp = requests.get(url, headers=get_headers("https://quote.eastmoney.com/"), timeout=8)
+        resp = session.get(url, headers=get_headers("https://quote.eastmoney.com/"), timeout=PER_REQUEST_TIMEOUT)
+        resp.raise_for_status()
         data = resp.json()
         if data and data.get("data") and data["data"].get("klines"):
             klines = data["data"]["klines"]
             parsed_history = [float(k.split(',')[2]) for k in klines]
             current = parsed_history[-1]
-            if current <= 0: return None
-
+            if current <= 0:
+                return None
             prev = parsed_history[-2] if len(parsed_history) >= 2 else current
             change = current - prev
-            pct = (change / prev) * 100
-
+            pct = (change / prev) * 100 if prev != 0 else 0
             advice, icon, pos_pct, w_low, w_high = calculate_technical_advice(current, parsed_history[:-1])
-
-            history_str = []
-            if len(parsed_history) >= 4:
-                history_str = [str(p) for p in parsed_history[-4:-1]]
-
+            history_str = [str(p) for p in parsed_history[-4:-1]] if len(parsed_history) >= 4 else []
             return {
                 "source": "东方财富",
                 "price": round(current, 2),
                 "change": round(change, 2),
                 "change_pct": round(pct, 2),
-                "advice": advice, "advice_icon": icon, "pos_pct": pos_pct,
-                "week_low": w_low, "week_high": w_high, "history_trend": history_str,
+                "advice": advice,
+                "advice_icon": icon,
+                "pos_pct": pos_pct,
+                "week_low": w_low,
+                "week_high": w_high,
+                "history_trend": history_str,
                 "bg_color": "#5cb85c" if change < 0 else "#d9534f",
                 "est_price": round(current + 25, 1)
             }
     except Exception as e:
-        print(f"❌ 东方财富K线异常: {e}")
+        print(f"❌ 东方财富 异常: {e}")
     return None
 
-# --- 接口4: 第一黄金网 (国内垂直) ---
-def get_price_jijinhao():
-    print("--- [尝试 4] 第一黄金网 ---")
+def get_price_jijinhao(session: requests.Session) -> Optional[Dict[str, Any]]:
+    """
+    第一黄金网（示例解析）
+    """
     try:
         url = "https://api.jijinhao.com/sQuoteCenter/realTime.jsp?sCodes=JO_92233"
-        resp = requests.get(url, headers=get_headers("https://www.dyhjw.com/"), timeout=10)
-        if resp.status_code == 200:
-            match = re.search(r'=\s*({.*?})', resp.text)
-            if match:
-                json_str = match.group(1)
-                last = re.search(r'"last":"([\d\.]+)"', json_str)
-                pre = re.search(r'"pre_close":"([\d\.]+)"', json_str)
-                if last and pre:
-                    current = float(last.group(1))
-                    prev = float(pre.group(1))
-                    if current <= 0: return None
-
-                    change = current - prev
-                    pct = (change / prev) * 100
-                    advice, icon, score = generate_basic_advice(current, pct)
-                    return {
-                        "source": "第一黄金网",
-                        "price": current, "change": round(change, 2), "change_pct": round(pct, 2),
-                        "advice": advice, "advice_icon": icon, "pos_pct": score,
-                        "week_low": current, "week_high": current, "history_trend": [],
-                        "bg_color": "#5cb85c" if change < 0 else "#d9534f",
-                        "est_price": round(current + 25, 1)
-                    }
+        resp = session.get(url, headers=get_headers("https://www.dyhjw.com/"), timeout=PER_REQUEST_TIMEOUT)
+        resp.raise_for_status()
+        text = resp.text
+        match = re.search(r'=\s*({.*?})', text)
+        if match:
+            json_str = match.group(1)
+            last = re.search(r'"last":"([\d\.]+)"', json_str)
+            pre = re.search(r'"pre_close":"([\d\.]+)"', json_str)
+            if last and pre:
+                current = float(last.group(1))
+                prev = float(pre.group(1))
+                if current <= 0:
+                    return None
+                change = current - prev
+                pct = (change / prev) * 100 if prev != 0 else 0
+                advice, icon, score = generate_basic_advice(current, pct)
+                return {
+                    "source": "第一黄金网",
+                    "price": current,
+                    "change": round(change, 2),
+                    "change_pct": round(pct, 2),
+                    "advice": advice,
+                    "advice_icon": icon,
+                    "pos_pct": score,
+                    "week_low": current,
+                    "week_high": current,
+                    "history_trend": [],
+                    "bg_color": "#5cb85c" if change < 0 else "#d9534f",
+                    "est_price": round(current + 25, 1)
+                }
     except Exception as e:
-        print(f"❌ 第一黄金网异常: {e}")
+        print(f"❌ 第一黄金网 异常: {e}")
     return None
 
-def send_pushplus(data):
-    print(f"--- 发起推送 ({data['source']}) ---")
-    date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-    change_sign = "+" if data['change'] > 0 else ""
+# ---------- 推送函数 ----------
+def send_pushplus(data: Dict[str, Any], token: Optional[str] = None, topic: Optional[str] = None):
+    token = token or TOKEN
+    topic = topic or TOPIC
+    if not token:
+        print("⚠️ PUSHPLUS_TOKEN 未配置，跳过推送（仅打印）")
+        print(json.dumps(data, ensure_ascii=False, indent=2))
+        return
 
+    date_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    change_sign = "+" if data.get('change', 0) > 0 else ""
     trend_html = ""
-    if data['history_trend']:
-        trend_items = "".join([f"<span style='background:#f3f3f3; padding:2px 5px; margin-right:4px; color:#555;'>{p}</span>" for p in data['history_trend']])
+    if data.get('history_trend'):
+        trend_items = "".join([f"<span style='background:#f3f3f3; padding:2px 5px; margin-right:4px; color:#555;'>{p}</span>"
+                               for p in data['history_trend']])
         trend_html = f"<div style='margin-top:10px; font-size:12px; color:#666;'>近3日: {trend_items} <span style='font-weight:bold;'>→ {data['price']}</span></div>"
 
-    # 颜色处理
     bg_color = data.get('bg_color', '#333333')
 
     content = f"""
@@ -295,51 +313,86 @@ def send_pushplus(data):
     </div>
     """
 
-    url = 'http://www.pushplus.plus/send'
     payload = {
-        "token": TOKEN,
-        "title": f"{data['advice_icon']} 金价: {data['price']} ({change_sign}{data['change']})",
+        "token": token,
+        "title": f"{data.get('advice_icon','')} 金价: {data.get('price')} ({change_sign}{data.get('change')})",
         "content": content,
         "template": "html",
-        "topic": TOPIC
+        "topic": topic
     }
 
     try:
-        resp = requests.post(url, json=payload, headers=get_headers(), timeout=15)
-        print(f"✅ 推送响应: {resp.status_code}")
+        resp = requests.post("http://www.pushplus.plus/send", json=payload, headers=get_headers(), timeout=(3, 10))
+        print("✅ PushPlus 响应:", resp.status_code, resp.text[:200])
     except Exception as e:
-        print(f"❌ 推送失败: {e}")
+        print("❌ PushPlus 推送异常:", e)
+        print("📢 推送内容预览：")
+        print(json.dumps(payload, ensure_ascii=False)[:1000])
 
-if __name__ == "__main__":
-    print("=== 六重保险版 (最终奥义) 启动 ===")
+# ---------- 主流程（并行尝试多个源） ----------
+def main():
+    print("=== 优化版金价推送启动 ===")
+    start_time = time.time()
 
-    # 策略顺序：
-    # 1. GoldPrice.org: 专用数据源，最不容易被封
-    # 2. Binance: 币安API，高频交易级稳定，海外必通
-    # 3. 东方财富: 国内数据
-    # 4. 第一黄金网: 垂直数据
-    strategies = [
+    sources = [
         get_price_goldpriceorg,
         get_price_binance,
         get_price_eastmoney_history,
-        get_price_jijinhao
+        get_price_jijinhao,
     ]
 
-    data = None
-    for strategy in strategies:
-        data = strategy()
-        if data:
-            print(f"✅ 成功从 [{data['source']}] 获取数据")
-            break
-        else:
-            print("⚠️ 失败，切换下一个源...")
-            time.sleep(1.5)
+    result = None
+    with requests.Session() as session:
+        # 保持 session 的 headers（可以被单次覆盖）
+        session.headers.update({"Accept": "*/*"})
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+            futures = {ex.submit(src, session): src.__name__ for src in sources}
+            try:
+                # as_completed 返回迭代器，按完成顺序产出
+                for future in as_completed(futures, timeout=OVERALL_TIMEOUT):
+                    src_name = futures.get(future)
+                    try:
+                        data = future.result(timeout=0.1)
+                    except Exception as e:
+                        print(f"⚠ 源 {src_name} 执行失败: {e}")
+                        continue
 
-    if data:
+                    if data:
+                        print(f"✅ 成功从 [{data['source']}] 获取数据（来自 {src_name}）")
+                        result = data
+                        break
+                    else:
+                        print(f"⚠ 源 {src_name} 返回空结果，继续等待其它源...")
+            except Exception as e:
+                print("⚠ 并行等待超时或异常:", e)
+
+            # 如果拿到了 result，尝试取消其它还没完成的 future（不强制，但会释放资源）
+            if result is not None:
+                for f in futures:
+                    if not f.done():
+                        try:
+                            f.cancel()
+                        except Exception:
+                            pass
+
+    elapsed = time.time() - start_time
+    print(f"--- 总耗时: {elapsed:.2f}s ---")
+
+    if result:
         if TOKEN:
-            send_pushplus(data)
+            send_pushplus(result)
         else:
-            print("📢 [模拟推送] Token未配置")
-            print(json.dumps(data, indent=4, ensure_ascii=False))
+            print("📢 Token 未配置，打印结果：")
+            print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print("❌ 所有接口全军覆没")
+        print("❌ 所有接口均失败，未获取到金价。")
+        # 这里可以选择降级策略：比如只推送“今日任务失败”或重试一次（可视情况开启）
+        # 为了避免无限重试，默认不重试
+
+if __name__ == "__main__":
+    # 保证输出 utf-8
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+    main()
